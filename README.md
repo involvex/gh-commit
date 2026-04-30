@@ -81,9 +81,9 @@ ghc
 2. **Diff analysis**: Captures staged changes and sends to Kilo AI
 3. **Message generation**: AI generates a conventional commit message
 4. **Confirmation**: You see the message and choose:
-   - `y` - Accept and commit
-   - `n` - Cancel
-   - `edit` - Modify the message before committing
+   - `y` (press y) - Accept and commit
+   - `n` (press n) - Cancel
+   - `e` (press e) - Edit the message before committing
 5. **Commit**: Creates the commit with the final message
 6. **Push prompt**: "Push to remote? (y/n)"
    - `y` - Runs `git push`
@@ -114,7 +114,7 @@ Pushed successfully.
 ### Manual edit mode
 
 ```bash
-Accept this message? (y/n/edit): edit
+Accept this message? (y/n/edit): e
 Current: feat(api): add user authentication endpoint
 Enter new message: feat(auth): implement JWT login
 ```

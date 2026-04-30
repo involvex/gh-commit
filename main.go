@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+
+	"golang.org/x/term"
 )
 
 const (
@@ -199,25 +201,35 @@ func promptCommitConfirmation(message string) string {
 	fmt.Printf("\nGenerated commit message:\n  %s\n\n", message)
 	for {
 		fmt.Print("Accept this message? (y/n/edit): ")
-		reader := bufio.NewReader(os.Stdin)
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-			return ""
-		}
-		input = strings.TrimSpace(strings.ToLower(input))
+		input := readSingleChar()
+		fmt.Println() // newline after keypress
 
 		switch input {
 		case "y":
 			return message
 		case "n":
 			return ""
-		case "edit":
+		case "e", "edit", "ed", "edi": // match first few letters for edit
 			return editCommitMessage(message)
 		default:
-			fmt.Println("Please enter y, n, or edit.")
+			fmt.Println("Please press 'y', 'n', or 'e' (for edit).")
 		}
 	}
+}
+
+func readSingleChar() string {
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		// Fallback to line-based if raw mode fails
+		reader := bufio.NewReader(os.Stdin)
+		input, _ := reader.ReadString('\n')
+		return strings.TrimSpace(strings.ToLower(input))
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	b := make([]byte, 1)
+	os.Stdin.Read(b)
+	return strings.ToLower(string(b))
 }
 
 func editCommitMessage(current string) string {
@@ -244,24 +256,14 @@ func promptForCommitMessage() string {
 
 func shouldPush() bool {
 	fmt.Print("Push to remote? (y/n): ")
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-		return false
-	}
-	input = strings.TrimSpace(strings.ToLower(input))
-	return input == "y" || input == "yes"
+	input := readSingleChar()
+	fmt.Println()
+	return input == "y"
 }
 
 func shouldPushTags() bool {
 	fmt.Print("Push tags too? (y/n): ")
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-		return false
-	}
-	input = strings.TrimSpace(strings.ToLower(input))
-	return input == "y" || input == "yes"
+	input := readSingleChar()
+	fmt.Println()
+	return input == "y"
 }
