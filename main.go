@@ -5,56 +5,86 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/term"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
-
-	"golang.org/x/term"
 )
 
 const (
 	kiloAPIURL   = "https://api.kilo.ai/api/gateway/chat/completions"
 	model        = "kilo-auto/free"
-	systemPrompt = `You are a git commit message generator. Analyze the provided git diff and generate a conventional commit message following these rules:
-
-1. Use the format: <type>(<scope>): <description>
-   Types: feat, fix, docs, style, refactor, test, chore
-   Scope: optional component/module name
-   Description: concise imperative mood description
-
-2. Keep the subject line under 72 characters.
-3. Only output the commit message. No explanations, no backticks, no formatting.
-4. If the changes are minor or unclear, use 'chore' or 'docs' as appropriate.
-
-Examples:
-- feat(auth): add JWT token validation
-- fix(api): correct nil pointer in user handler
-- docs(readme): update installation instructions
-- chore: update dependencies`
-	maxTokens    = 100
-	temperature  = 0.5
+	systemPrompt = `Generate a conventional commit message for the following git diff.
+Format: type(scope): description
+Types: feat, fix, docs, refactor, test, chore, perf, build, ci, style
+Output ONLY the commit message.`
+	maxTokens   = 1024
+	temperature = 0.3
 )
 
 type ChatCompletionRequest struct {
-	Model    string        `json:"model"`
-	Messages []Message     `json:"messages"`
-	MaxTokens int          `json:"max_tokens,omitempty"`
+	Model       string    `json:"model"`
+	Messages    []Message `json:"messages"`
+	MaxTokens   int       `json:"max_tokens,omitempty"`
 	Temperature float64   `json:"temperature,omitempty"`
+	// Disable reasoning for non-reasoning output
+	Reasoning *ReasoningConfig `json:"reasoning,omitempty"`
+}
+
+type ReasoningConfig struct {
+	Enabled bool `json:"enabled"`
 }
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string `json:"role"`
+	Content   string `json:"content,omitempty"`
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 type ChatCompletionResponse struct {
 	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
+		Message Message `json:"message"`
 	} `json:"choices"`
+}
+
+func readChar() (string, error) {
+	// Try to put terminal in raw mode for immediate character reading
+	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+		oldState, err := term.MakeRaw(fd)
+		if err != nil {
+			// Fall back to line-based input if raw mode fails
+			return readLine()
+		}
+		defer term.Restore(fd, oldState)
+
+		var b [1]byte
+		if _, err := os.Stdin.Read(b[:]); err != nil {
+			return "", err
+		}
+		return string(b[:]), nil
+	}
+	// Fallback for non-terminal stdin
+	return readLine()
+}
+
+func readLine() (string, error) {
+	// Check if stdin is a terminal to give better error messages
+	if !term.IsTerminal(int(os.Stdin.Fd())) {
+		return "", fmt.Errorf("stdin is not a terminal; interactive input required")
+	}
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		if err == io.EOF {
+			// EOF indicates input was closed (e.g., Ctrl+Z on Windows) - treat as empty/cancel
+			return "", nil
+		}
+		return "", err
+	}
+	return strings.TrimSpace(line), nil
 }
 
 func main() {
@@ -144,10 +174,12 @@ func getStagedDiff() (string, error) {
 }
 
 func generateCommitMessage(apiKey, diff string) (string, error) {
+	// First, try to get a message from the Kilo API
 	reqBody := ChatCompletionRequest{
-		Model:     model,
-		MaxTokens: maxTokens,
+		Model:       model,
+		MaxTokens:   maxTokens,
 		Temperature: temperature,
+		Reasoning:   &ReasoningConfig{Enabled: false},
 		Messages: []Message{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: diff},
@@ -175,7 +207,11 @@ func generateCommitMessage(apiKey, diff string) (string, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API error %d: %s", resp.StatusCode, string(body))
+		// Check for rate limit
+		if resp.StatusCode == http.StatusTooManyRequests || strings.Contains(string(body), "429") {
+			fmt.Fprintln(os.Stderr, "Rate limit exceeded. Try again in a minute.")
+		}
+		return "", fmt.Errorf("API error: status=%d, body=%s", resp.StatusCode, string(body))
 	}
 
 	var result ChatCompletionResponse
@@ -187,83 +223,204 @@ func generateCommitMessage(apiKey, diff string) (string, error) {
 		return "", fmt.Errorf("no choices returned from API")
 	}
 
-	msg := strings.TrimSpace(result.Choices[0].Message.Content)
-	// Remove backticks if present
+	content := result.Choices[0].Message.Content
+	reasoning := result.Choices[0].Message.Reasoning
+
+	// Use content field first
+	msg := strings.TrimSpace(content)
+
+	// If content is empty, try to extract a commit message from reasoning
+	if msg == "" && reasoning != "" {
+		// Strategy 1: Find conventional commit pattern anywhere in reasoning
+		if extracted := extractConventionalCommit(reasoning); extracted != "" {
+			msg = extracted
+		}
+
+		// Strategy 2: Look for lines containing "commit" followed by a conventional pattern
+		if msg == "" {
+			lines := strings.Split(reasoning, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if strings.Contains(strings.ToLower(line), "commit") {
+					if extracted := extractConventionalCommit(line); extracted != "" {
+						msg = extracted
+						break
+					}
+				}
+			}
+		}
+
+		// Strategy 3: Find any line starting with a valid type followed by colon
+		if msg == "" {
+			lines := strings.Split(reasoning, "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				lower := strings.ToLower(line)
+				if strings.HasPrefix(lower, "feat") || strings.HasPrefix(lower, "fix") ||
+					strings.HasPrefix(lower, "docs") || strings.HasPrefix(lower, "style") ||
+					strings.HasPrefix(lower, "refactor") || strings.HasPrefix(lower, "test") ||
+					strings.HasPrefix(lower, "chore") || strings.HasPrefix(lower, "perf") ||
+					strings.HasPrefix(lower, "build") || strings.HasPrefix(lower, "ci") {
+					// Check if it has a colon (looks like a commit message)
+					if strings.Contains(line, ":") {
+						msg = cleanCommitMessage(line)
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// If still empty, return error to trigger manual fallback
+	if msg == "" {
+		return "", fmt.Errorf("AI returned empty response")
+	}
+
+	// Clean up the message
+	msg = cleanCommitMessage(msg)
+
+	// Reject generic "miscellaneous" messages
+	if strings.Contains(strings.ToLower(msg), "miscellaneous") {
+		return "", fmt.Errorf("AI returned generic message containing 'miscellaneous'")
+	}
+
+	// Validate that it looks like a conventional commit message
+	if !isValidConventionalCommit(msg) {
+		// Try to extract the commit message from conversational text
+		if extracted := extractConventionalCommit(msg); extracted != "" {
+			msg = extracted
+		} else {
+			return "", fmt.Errorf("AI response does not match conventional commit format")
+		}
+	}
+
+	return msg, nil
+}
+
+// cleanCommitMessage removes formatting artifacts and trailing noise
+func cleanCommitMessage(msg string) string {
+	// Remove backticks and markdown fences
 	msg = strings.Trim(msg, "`")
-	// Take first line only (commit messages should be single-line)
+	msg = strings.TrimPrefix(msg, "```")
+	msg = strings.TrimSuffix(msg, "```")
+
+	// Take first line only
 	if idx := strings.Index(msg, "\n"); idx != -1 {
 		msg = strings.TrimSpace(msg[:idx])
 	}
-	return msg, nil
+
+	// Truncate at first occurrence of common trailing noise
+	for _, sep := range []string{",", ".", "!", "?", " and ", " or ", " so ", " thus ", " therefore "} {
+		if idx := strings.Index(msg, sep); idx != -1 {
+			msg = strings.TrimSpace(msg[:idx])
+		}
+	}
+
+	// Keep under 72 characters
+	if len(msg) > 72 {
+		msg = msg[:72]
+	}
+	return strings.TrimSpace(msg)
+}
+
+// isValidConventionalCommit checks if the message matches conventional commit format exactly
+func isValidConventionalCommit(msg string) bool {
+	// Pattern: type(scope)?: description (non-empty description required)
+	validTypes := `feat|fix|docs|style|refactor|test|chore|perf|build|ci`
+	// Allow any non-empty characters in scope (if present) and any non-newline chars in description
+	pattern := `^(` + validTypes + `)(\([^)]+\))?:\s*.+$`
+
+	re := regexp.MustCompile(pattern)
+	return re.MatchString(strings.ToLower(msg))
+}
+
+// extractConventionalCommit searches for a conventional commit pattern within text
+func extractConventionalCommit(text string) string {
+	// Split into lines and check each
+	lines := strings.Split(text, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && isValidConventionalCommit(line) {
+			// Clean it up further
+			return cleanCommitMessage(line)
+		}
+	}
+
+	// If no full line matches, try to extract using regex from the whole text
+	validTypes := `feat|fix|docs|style|refactor|test|chore|perf|build|ci`
+	pattern := `(` + validTypes + `)(\([^)]+\))?:\s*.+`
+	re := regexp.MustCompile(pattern)
+	if match := re.FindString(strings.ToLower(text)); match != "" {
+		// Clean up and return
+		return cleanCommitMessage(match)
+	}
+
+	return ""
 }
 
 func promptCommitConfirmation(message string) string {
 	fmt.Printf("\nGenerated commit message:\n  %s\n\n", message)
+
 	for {
 		fmt.Print("Accept this message? (y/n/edit): ")
-		input := readSingleChar()
-		fmt.Println() // newline after keypress
-
+		input, err := readChar()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error reading input:", err)
+			return ""
+		}
+		input = strings.ToLower(input)
 		switch input {
 		case "y":
 			return message
 		case "n":
 			return ""
-		case "e", "edit", "ed", "edi": // match first few letters for edit
+		case "e":
 			return editCommitMessage(message)
 		default:
-			fmt.Println("Please press 'y', 'n', or 'e' (for edit).")
+			fmt.Println("Please enter 'y', 'n', or 'e' (for edit).")
 		}
 	}
 }
 
-func readSingleChar() string {
-	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-	if err != nil {
-		// Fallback to line-based if raw mode fails
-		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
-		return strings.TrimSpace(strings.ToLower(input))
-	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-	b := make([]byte, 1)
-	os.Stdin.Read(b)
-	return strings.ToLower(string(b))
-}
-
 func editCommitMessage(current string) string {
 	fmt.Printf("Current: %s\nEnter new message: ", current)
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
+	input, err := readLine()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
 		return ""
 	}
-	return strings.TrimSpace(input)
+	return input
 }
 
 func promptForCommitMessage() string {
 	fmt.Println("Enter commit message manually:")
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
+	input, err := readLine()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
 		os.Exit(1)
 	}
-	return strings.TrimSpace(input)
+	return input
 }
 
 func shouldPush() bool {
 	fmt.Print("Push to remote? (y/n): ")
-	input := readSingleChar()
-	fmt.Println()
-	return input == "y"
+	input, err := readChar()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading input:", err)
+		return false
+	}
+	return strings.ToLower(input) == "y"
 }
 
 func shouldPushTags() bool {
 	fmt.Print("Push tags too? (y/n): ")
-	input := readSingleChar()
-	fmt.Println()
-	return input == "y"
+	input, err := readChar()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading input:", err)
+		return false
+	}
+	return strings.ToLower(input) == "y"
 }

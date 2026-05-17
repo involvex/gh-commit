@@ -1,7 +1,7 @@
 # AGENTS.md — Quick context for working on gh-commit
 
 ## What this repo does
-Go-based GitHub CLI extension that stages all changes and generates conventional commit messages via the Kilo AI Gateway (`kilo-auto/free`). Single binary (`main.go`), no package subdirectories.
+Go-based GitHub CLI extension that stages all changes and generates conventional commit messages via the Kilo AI Gateway (`kilo-auto/small`). Single binary (`main.go`), no package subdirectories.
 
 ## Key commands
 - Build: `go build -o gh-commit .`

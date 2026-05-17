@@ -5,7 +5,7 @@ AI-powered git commit automation for GitHub CLI. One command to stage, generate 
 ## Features
 
 - **Stage all changes**: Automatically runs `git add .` to stage all modifications
-- **AI-generated messages**: Uses Kilo AI Gateway (`kilo-auto/free` model) to generate conventional commit messages
+- **AI-generated messages**: Uses Kilo AI Gateway (`kilo-auto/small` model) to generate conventional commit messages
 - **User confirmation**: Review and optionally edit the generated message before committing
 - **Smart push workflow**: Prompts to push commits and tags after successful commit
 - **Manual fallback**: If AI generation fails, you can type a commit message manually
