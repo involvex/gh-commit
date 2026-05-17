@@ -17,10 +17,21 @@ import (
 const (
 	kiloAPIURL   = "https://api.kilo.ai/api/gateway/chat/completions"
 	model        = "kilo-auto/free"
-	systemPrompt = `Generate a conventional commit message for the following git diff.
-Format: type(scope): description
-Types: feat, fix, docs, refactor, test, chore, perf, build, ci, style
-Output ONLY the commit message.`
+	systemPrompt = `You are a git commit message expert. Analyze the CHANGED FILES SUMMARY and FULL DIFF provided by the user.
+
+RULES:
+1. Analyze ALL changed files to understand the FULL scope of changes
+2. Format: type(scope): description
+3. Types: feat, fix, docs, refactor, test, chore, perf, build, ci, style
+4. Scope: use the most relevant component/module name
+5. Description: imperative mood, specific to what changed, no trailing punctuation
+6. Output ONLY the commit message - no explanations, no backticks
+
+Guidelines:
+- If many files change the same feature, describe that feature
+- If changes span multiple areas, use a broader scope or focus on the primary change
+- NEVER output generic messages like "update files" or "changed X files"
+- NEVER mention file counts or line counts in the description`
 	maxTokens   = 1024
 	temperature = 0.3
 )
@@ -30,12 +41,6 @@ type ChatCompletionRequest struct {
 	Messages    []Message `json:"messages"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`
 	Temperature float64   `json:"temperature,omitempty"`
-	// Disable reasoning for non-reasoning output
-	Reasoning *ReasoningConfig `json:"reasoning,omitempty"`
-}
-
-type ReasoningConfig struct {
-	Enabled bool `json:"enabled"`
 }
 
 type Message struct {
@@ -103,7 +108,7 @@ func main() {
 	}
 
 	// 3. Get staged diff
-	diff, err := getStagedDiff()
+	diff, diffSummary, err := getStagedDiff()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting staged diff: %v\n", err)
 		os.Exit(1)
@@ -116,7 +121,7 @@ func main() {
 
 	// 4. Generate commit message via Kilo API
 	fmt.Println("Generating commit message...")
-	commitMsg, err := generateCommitMessage(apiKey, diff)
+	commitMsg, err := generateCommitMessage(apiKey, diffSummary, diff)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error generating commit message: %v\n", err)
 		fmt.Println("Falling back to manual entry...")
@@ -165,24 +170,40 @@ func runGitCmd(name string, args ...string) error {
 	return cmd.Run()
 }
 
-func getStagedDiff() (string, error) {
-	cmd := exec.Command("git", "diff", "--cached")
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	err := cmd.Run()
-	return out.String(), err
+// getStagedDiff returns the staged diff and a summary of changed files
+func getStagedDiff() (diff string, summary string, err error) {
+	// Get the full diff
+	diffCmd := exec.Command("git", "diff", "--cached")
+	var diffOut bytes.Buffer
+	diffCmd.Stdout = &diffOut
+	err = diffCmd.Run()
+	diff = diffOut.String()
+	if err != nil {
+		return
+	}
+
+	// Get a summary of changed files
+	summaryCmd := exec.Command("git", "diff", "--cached", "--stat")
+	var summaryOut bytes.Buffer
+	summaryCmd.Stdout = &summaryOut
+	summaryCmd.Run()
+	summary = summaryOut.String()
+
+	return
 }
 
-func generateCommitMessage(apiKey, diff string) (string, error) {
+func generateCommitMessage(apiKey, diffSummary, diff string) (string, error) {
 	// First, try to get a message from the Kilo API
+	// Send summary first, then full diff for context
+	userContent := fmt.Sprintf("CHANGED FILES SUMMARY:\n%s\n\nFULL DIFF:\n%s", diffSummary, diff)
+
 	reqBody := ChatCompletionRequest{
 		Model:       model,
 		MaxTokens:   maxTokens,
 		Temperature: temperature,
-		Reasoning:   &ReasoningConfig{Enabled: false},
 		Messages: []Message{
 			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: diff},
+			{Role: "user", Content: userContent},
 		},
 	}
 
