@@ -31,7 +31,10 @@ Guidelines:
 - If many files change the same feature, describe that feature
 - If changes span multiple areas, use a broader scope or focus on the primary change
 - NEVER output generic messages like "update files" or "changed X files"
-- NEVER mention file counts or line counts in the description`
+- NEVER mention file counts or line counts in the description
+- NEVER describe changes by listing file paths
+- Focus on the logical change or intent, not the files modified
+- If you cannot determine the intent, use "chore: minor changes" instead of listing files`
 	maxTokens   = 1024
 	temperature = 0.3
 )
@@ -170,7 +173,7 @@ func runGitCmd(name string, args ...string) error {
 	return cmd.Run()
 }
 
-// getStagedDiff returns the staged diff and a summary of changed files
+// getStagedDiff returns the staged diff, a summary of changed files, and file status
 func getStagedDiff() (diff string, summary string, err error) {
 	// Get the full diff
 	diffCmd := exec.Command("git", "diff", "--cached")
@@ -189,6 +192,17 @@ func getStagedDiff() (diff string, summary string, err error) {
 	summaryCmd.Run()
 	summary = summaryOut.String()
 
+	// Get file status codes (A/M/D/R)
+	statusCmd := exec.Command("git", "status", "--short", "--branch")
+	var statusOut bytes.Buffer
+	statusCmd.Stdout = &statusOut
+	if err := statusCmd.Run(); err == nil {
+		status := statusOut.String()
+		if status != "" {
+			summary = "STAGED FILES:\n" + status + "\n\n" + summary
+		}
+	}
+
 	return
 }
 
@@ -197,128 +211,198 @@ func generateCommitMessage(apiKey, diffSummary, diff string) (string, error) {
 	// Send summary first, then full diff for context
 	userContent := fmt.Sprintf("CHANGED FILES SUMMARY:\n%s\n\nFULL DIFF:\n%s", diffSummary, diff)
 
-	reqBody := ChatCompletionRequest{
-		Model:       model,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-		Messages: []Message{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: userContent},
-		},
-	}
-
-	jsonData, err := json.Marshal(reqBody)
-	if err != nil {
-		return "", fmt.Errorf("marshal request: %w", err)
-	}
-
-	req, err := http.NewRequest("POST", kiloAPIURL, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		// Check for rate limit
-		if resp.StatusCode == http.StatusTooManyRequests || strings.Contains(string(body), "429") {
-			fmt.Fprintln(os.Stderr, "Rate limit exceeded. Try again in a minute.")
+	// Helper function to call the API
+	callAPI := func(messages []Message) (string, string, error) {
+		reqBody := ChatCompletionRequest{
+			Model:       model,
+			MaxTokens:   maxTokens,
+			Temperature: temperature,
+			Messages:    messages,
 		}
-		return "", fmt.Errorf("API error: status=%d, body=%s", resp.StatusCode, string(body))
+
+		jsonData, err := json.Marshal(reqBody)
+		if err != nil {
+			return "", "", fmt.Errorf("marshal request: %w", err)
+		}
+
+		req, err := http.NewRequest("POST", kiloAPIURL, bytes.NewBuffer(jsonData))
+		if err != nil {
+			return "", "", fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", "", fmt.Errorf("send request: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode == http.StatusTooManyRequests || strings.Contains(string(body), "429") {
+				fmt.Fprintln(os.Stderr, "Rate limit exceeded. Try again in a minute.")
+			}
+			return "", "", fmt.Errorf("API error: status=%d, body=%s", resp.StatusCode, string(body))
+		}
+
+		var result ChatCompletionResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return "", "", fmt.Errorf("decode response: %w", err)
+		}
+
+		if len(result.Choices) == 0 {
+			return "", "", fmt.Errorf("no choices returned from API")
+		}
+
+		return result.Choices[0].Message.Content, result.Choices[0].Message.Reasoning, nil
 	}
 
-	var result ChatCompletionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", fmt.Errorf("decode response: %w", err)
+	// Try to get message from API (up to 2 attempts)
+	messages := []Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userContent},
 	}
 
-	if len(result.Choices) == 0 {
-		return "", fmt.Errorf("no choices returned from API")
+	var msg string
+	var apiErr error
+
+	for attempt := 0; attempt < 2; attempt++ {
+		content, reasoning, err := callAPI(messages)
+		if err != nil {
+			apiErr = err
+			break
+		}
+
+		// Extract message using existing logic
+		msg = extractCommitMessage(content, reasoning)
+
+		// Clean up the message
+		msg = cleanCommitMessage(msg)
+
+		// Reject generic messages
+		if strings.Contains(strings.ToLower(msg), "miscellaneous") {
+			apiErr = fmt.Errorf("AI returned generic message containing 'miscellaneous'")
+			break
+		}
+
+		// Validate conventional commit format
+		if !isValidConventionalCommit(msg) {
+			if extracted := extractConventionalCommit(msg); extracted != "" {
+				msg = extracted
+			} else {
+				apiErr = fmt.Errorf("AI response does not match conventional commit format")
+				break
+			}
+		}
+
+		// Check for generic/file-path messages
+		if isMessageTooGeneric(msg) {
+			if attempt == 0 {
+				// Retry with feedback
+				messages = append(messages, Message{
+					Role:    "user",
+					Content: "Your previous message described files instead of intent. Generate a message that explains the *purpose* or *intent* of the changes, not which files were modified. Focus on what was accomplished.",
+				})
+				continue
+			}
+			apiErr = fmt.Errorf("AI returned file-focused message after retry")
+			break
+		}
+
+		return msg, nil
 	}
 
-	content := result.Choices[0].Message.Content
-	reasoning := result.Choices[0].Message.Reasoning
+	return "", apiErr
+}
 
-	// Use content field first
+// extractCommitMessage extracts a commit message from API response content
+func extractCommitMessage(content, reasoning string) string {
 	msg := strings.TrimSpace(content)
 
-	// If content is empty, try to extract a commit message from reasoning
+	// If content is empty, try to extract from reasoning
 	if msg == "" && reasoning != "" {
-		// Strategy 1: Find conventional commit pattern anywhere in reasoning
 		if extracted := extractConventionalCommit(reasoning); extracted != "" {
-			msg = extracted
+			return extracted
 		}
 
-		// Strategy 2: Look for lines containing "commit" followed by a conventional pattern
-		if msg == "" {
-			lines := strings.Split(reasoning, "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if strings.Contains(strings.ToLower(line), "commit") {
-					if extracted := extractConventionalCommit(line); extracted != "" {
-						msg = extracted
-						break
-					}
+		lines := strings.Split(reasoning, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.Contains(strings.ToLower(line), "commit") {
+				if extracted := extractConventionalCommit(line); extracted != "" {
+					return extracted
 				}
 			}
 		}
 
-		// Strategy 3: Find any line starting with a valid type followed by colon
-		if msg == "" {
-			lines := strings.Split(reasoning, "\n")
-			for _, line := range lines {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				lower := strings.ToLower(line)
-				if strings.HasPrefix(lower, "feat") || strings.HasPrefix(lower, "fix") ||
-					strings.HasPrefix(lower, "docs") || strings.HasPrefix(lower, "style") ||
-					strings.HasPrefix(lower, "refactor") || strings.HasPrefix(lower, "test") ||
-					strings.HasPrefix(lower, "chore") || strings.HasPrefix(lower, "perf") ||
-					strings.HasPrefix(lower, "build") || strings.HasPrefix(lower, "ci") {
-					// Check if it has a colon (looks like a commit message)
-					if strings.Contains(line, ":") {
-						msg = cleanCommitMessage(line)
-						break
-					}
+		lines = strings.Split(reasoning, "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			lower := strings.ToLower(line)
+			if strings.HasPrefix(lower, "feat") || strings.HasPrefix(lower, "fix") ||
+				strings.HasPrefix(lower, "docs") || strings.HasPrefix(lower, "style") ||
+				strings.HasPrefix(lower, "refactor") || strings.HasPrefix(lower, "test") ||
+				strings.HasPrefix(lower, "chore") || strings.HasPrefix(lower, "perf") ||
+				strings.HasPrefix(lower, "build") || strings.HasPrefix(lower, "ci") {
+				if strings.Contains(line, ":") {
+					return cleanCommitMessage(line)
 				}
 			}
 		}
 	}
 
-	// If still empty, return error to trigger manual fallback
-	if msg == "" {
-		return "", fmt.Errorf("AI returned empty response")
+	return msg
+}
+
+// isMessageTooGeneric detects commit messages that are overly file-focused or lack semantic meaning
+func isMessageTooGeneric(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+
+	// Check for file path patterns at end or throughout description
+	// Detects patterns like "add .kilo/plans/file.md" or "update README.md"
+	filePathPattern := regexp.MustCompile(`(^|\s)(add|update|remove|delete|modify)\s+(\.?[a-z0-9_\-./]+\.[a-z]{1,4})(\s|$|\n)`)
+	if filePathPattern.MatchString(lower) {
+		return true
 	}
 
-	// Clean up the message
-	msg = cleanCommitMessage(msg)
-
-	// Reject generic "miscellaneous" messages
-	if strings.Contains(strings.ToLower(msg), "miscellaneous") {
-		return "", fmt.Errorf("AI returned generic message containing 'miscellaneous'")
-	}
-
-	// Validate that it looks like a conventional commit message
-	if !isValidConventionalCommit(msg) {
-		// Try to extract the commit message from conversational text
-		if extracted := extractConventionalCommit(msg); extracted != "" {
-			msg = extracted
-		} else {
-			return "", fmt.Errorf("AI response does not match conventional commit format")
+	// Check for directory-style path patterns (contains slashes and looks like a file path)
+	// Matches things like ".kilo/plans/..." or "src/main.go"
+	if matches := regexp.MustCompile(`(^|\s)[\.a-z0-9_\-]+/[\.a-z0-9_\-]+`).FindAllString(lower, -1); len(matches) > 0 {
+		// Count how many matched patterns look like file paths
+		pathLikeCount := 0
+		for _, m := range matches {
+			m = strings.TrimSpace(m)
+			if strings.Contains(m, ".") || strings.Count(m, "/") >= 1 {
+				pathLikeCount++
+			}
+		}
+		if pathLikeCount >= 1 {
+			// If description is mostly path-like, it's too generic
+			words := strings.Fields(lower)
+			if len(words) > 0 && pathLikeCount >= len(words)/2 {
+				return true
+			}
 		}
 	}
 
-	return msg, nil
+	// Check for simple file operations without meaningful description
+	// e.g., "chore: add file", "feat: update main.go"
+	if strings.Contains(lower, "add ") && regexp.MustCompile(`add\s+[a-z0-9_\-./]+\.[a-z]{2,4}\s*$`).MatchString(lower) {
+		return true
+	}
+	if strings.Contains(lower, "update ") && regexp.MustCompile(`update\s+[a-z0-9_\-./]+\.[a-z]{2,4}\s*$`).MatchString(lower) {
+		return true
+	}
+	if strings.Contains(lower, "remove ") && regexp.MustCompile(`remove\s+[a-z0-9_\-./]+\.[a-z]{2,4}\s*$`).MatchString(lower) {
+		return true
+	}
+
+	return false
 }
 
 // cleanCommitMessage removes formatting artifacts and trailing noise
@@ -338,6 +422,13 @@ func cleanCommitMessage(msg string) string {
 		if idx := strings.Index(msg, sep); idx != -1 {
 			msg = strings.TrimSpace(msg[:idx])
 		}
+	}
+
+	// Remove trailing file paths from description
+	// Match file paths with extensions that appear at the end
+	pathPattern := regexp.MustCompile(`(\s+[a-z]:[\\/])?[\\/]?((\.\/|\.\.\/|[a-z0-9_\-]+)[\\/])*([a-z0-9_\-]+\.[a-z]{2,4})\s*$`)
+	if pathPattern.MatchString(msg) {
+		msg = strings.TrimSpace(pathPattern.ReplaceAllString(msg, ""))
 	}
 
 	// Keep under 72 characters
