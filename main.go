@@ -27,12 +27,15 @@ RULES:
 5. Description: imperative mood, specific to what changed, no trailing punctuation
 6. Output ONLY the commit message - no explanations, no backticks
 
+FORBIDDEN:
+- NEVER mention line counts (e.g. "changed 20 lines", "modified 5 lines")
+- NEVER mention file counts (e.g. "changed 3 files")
+- NEVER describe changes by listing file paths or filenames
+
 Guidelines:
 - If many files change the same feature, describe that feature
 - If changes span multiple areas, use a broader scope or focus on the primary change
 - NEVER output generic messages like "update files" or "changed X files"
-- NEVER mention file counts or line counts in the description
-- NEVER describe changes by listing file paths
 - Focus on the logical change or intent, not the files modified
 - If you cannot determine the intent, use "chore: minor changes" instead of listing files`
 	maxTokens   = 1024
@@ -297,6 +300,20 @@ func generateCommitMessage(apiKey, diffSummary, diff string) (string, error) {
 			}
 		}
 
+		// Check for line count patterns
+		lineCountPattern := regexp.MustCompile(`(?i)(changed|modified|updated|added|removed)?\s*\d+\s*lines?\s*$`)
+		if lineCountPattern.MatchString(strings.ToLower(msg)) {
+			if attempt == 0 {
+				messages = append(messages, Message{
+					Role:    "user",
+					Content: "Your message contains a line count (e.g., 'changed 20 lines'). This is not allowed. Describe the PURPOSE or INTENT of the changes, not how many lines were modified. Example: 'feat: add user authentication' instead of 'changed 50 lines'.",
+				})
+				continue
+			}
+			apiErr = fmt.Errorf("AI returned line-count message after retry")
+			break
+		}
+
 		// Check for generic/file-path messages
 		if isMessageTooGeneric(msg) {
 			if attempt == 0 {
@@ -362,6 +379,12 @@ func extractCommitMessage(content, reasoning string) string {
 // isMessageTooGeneric detects commit messages that are overly file-focused or lack semantic meaning
 func isMessageTooGeneric(msg string) bool {
 	lower := strings.ToLower(strings.TrimSpace(msg))
+
+	// Check for line count patterns like "changed 20 lines" or "modified 5 lines"
+	lineCountPattern := regexp.MustCompile(`(?i)(changed|modified|updated|added|removed)?\s*\d+\s*lines?\s*$`)
+	if lineCountPattern.MatchString(lower) {
+		return true
+	}
 
 	// Check for file path patterns at end or throughout description
 	// Detects patterns like "add .kilo/plans/file.md" or "update README.md"
@@ -429,6 +452,12 @@ func cleanCommitMessage(msg string) string {
 	pathPattern := regexp.MustCompile(`(\s+[a-z]:[\\/])?[\\/]?((\.\/|\.\.\/|[a-z0-9_\-]+)[\\/])*([a-z0-9_\-]+\.[a-z]{2,4})\s*$`)
 	if pathPattern.MatchString(msg) {
 		msg = strings.TrimSpace(pathPattern.ReplaceAllString(msg, ""))
+	}
+
+	// Remove trailing line count patterns
+	lineCountPattern := regexp.MustCompile(`(?i)\s*[-–—]\s*(changed|modified|updated|added|removed)?\s*\d+\s*lines?\s*$`)
+	if lineCountPattern.MatchString(msg) {
+		msg = strings.TrimSpace(lineCountPattern.ReplaceAllString(msg, ""))
 	}
 
 	// Keep under 72 characters
