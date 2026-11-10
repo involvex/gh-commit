@@ -271,7 +271,7 @@ func generateCommitMessage(apiKey, diffSummary, diff string) (string, error) {
 	var msg string
 	var apiErr error
 
-	for attempt := 0; attempt < 2; attempt++ {
+	for attempt := range 2 {
 		content, reasoning, err := callAPI(messages)
 		if err != nil {
 			apiErr = err
@@ -481,8 +481,8 @@ func isValidConventionalCommit(msg string) bool {
 // extractConventionalCommit searches for a conventional commit pattern within text
 func extractConventionalCommit(text string) string {
 	// Split into lines and check each
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(text, "\n")
+	for line := range lines {
 		line = strings.TrimSpace(line)
 		if line != "" && isValidConventionalCommit(line) {
 			// Clean it up further

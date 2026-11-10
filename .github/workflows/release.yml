@@ -3,6 +3,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 permissions:
   contents: write
   id-token: write
@@ -17,3 +18,13 @@ jobs:
         with:
           generate_attestations: true
           go_version_file: go.mod
+      - name: Install dependencies
+        run: apt-get install -y clang llvm android-sdk-build-tools
+      - name: Build for Android arm64
+        run: GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=$NDK_ROOT/21.3.6528147/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang go build && ls -la ./build/android-arm64/
+      - name: Build for Android arm
+        run: GOOS=android GOARCH=arm CGO_ENABLED=1 CC=$NDK_ROOT/21.3.6528147/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi21-clang go build && ls -la ./build/android-arm/
+      - name: Build for Android x86
+        run: GOOS=android GOARCH=386 CGO_ENABLED=1 CC=$NDK_ROOT/21.3.6528147/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android21-clang go build && ls -la ./build/android-x86/
+      - name: Build for Android x86_64
+        run: GOOS=android GOARCH=amd64 CGO_ENABLED=1 CC=$NDK_ROOT/21.3.6528147/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android21-clang go build && ls -la ./build/android-x86_64/
