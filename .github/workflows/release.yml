@@ -19,7 +19,7 @@ jobs:
           generate_attestations: true
           go_version_file: go.mod
       - name: Install dependencies
-        run: apt-get install -y clang llvm android-sdk-build-tools
+        run: sudo apt-get install -y clang llvm android-sdk-build-tools
       - name: Build for Android arm64
         run: GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC=$NDK_ROOT/21.3.6528147/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android30-clang go build && ls -la ./build/android-arm64/
       - name: Build for Android arm
